@@ -8,20 +8,41 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Configuración
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// Crear cliente de Supabase de forma lazy
+let supabase = null;
+
+const getSupabase = () => {
+  if (!supabase) {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_KEY;
+    
+    if (!url || !key) {
+      throw new Error('SUPABASE_URL y SUPABASE_SERVICE_KEY son requeridas');
+    }
+    
+    supabase = createClient(url, key);
+  }
+  return supabase;
+};
 
 // Multer para recibir archivos
 const upload = multer({ 
   dest: '/tmp/uploads/',
-  limits: { fileSize: 200 * 1024 * 1024 } // 200MB máximo entrada
+  limits: { fileSize: 200 * 1024 * 1024 }
 });
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'shifty-video-compressor' });
+  const hasUrl = !!process.env.SUPABASE_URL;
+  const hasKey = !!process.env.SUPABASE_SERVICE_KEY;
+  res.json({ 
+    status: 'ok', 
+    service: 'shifty-video-compressor',
+    config: {
+      supabaseUrl: hasUrl ? 'configured' : 'missing',
+      supabaseKey: hasKey ? 'configured' : 'missing'
+    }
+  });
 });
 
 // Endpoint principal
@@ -39,21 +60,26 @@ app.post('/compress', upload.single('video'), async (req, res) => {
   console.log(`[Compress] Iniciando: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(2)}MB)`);
 
   try {
+    // Obtener cliente de Supabase
+    const supabaseClient = getSupabase();
+
     // 1. Comprimir con FFmpeg
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
-          '-vf', 'scale=-2:480',      // 480p altura, ancho proporcional
-          '-c:v', 'libx264',           // Codec H.264
-          '-crf', '28',                // Calidad (23-28 es bueno, mayor = más compresión)
-          '-preset', 'fast',           // Balance velocidad/compresión
-          '-c:a', 'aac',               // Audio AAC
-          '-b:a', '128k',              // Audio bitrate
-          '-movflags', '+faststart',   // Optimizado para streaming
+          '-vf', 'scale=-2:480',
+          '-c:v', 'libx264',
+          '-crf', '28',
+          '-preset', 'fast',
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-movflags', '+faststart',
         ])
         .output(outputPath)
-        .on('start', (cmd) => console.log('[FFmpeg] Comando:', cmd))
-        .on('progress', (p) => console.log(`[FFmpeg] Progreso: ${p.percent?.toFixed(1)}%`))
+        .on('start', (cmd) => console.log('[FFmpeg] Iniciando compresión...'))
+        .on('progress', (p) => {
+          if (p.percent) console.log(`[FFmpeg] Progreso: ${p.percent.toFixed(1)}%`);
+        })
         .on('end', resolve)
         .on('error', reject)
         .run();
@@ -65,14 +91,14 @@ app.post('/compress', upload.single('video'), async (req, res) => {
     console.log(`[Compress] Comprimido: ${compressedSizeMB.toFixed(2)}MB`);
 
     if (compressedSizeMB > 45) {
-      throw new Error(`Video comprimido sigue siendo muy grande: ${compressedSizeMB.toFixed(2)}MB`);
+      throw new Error(`Video comprimido muy grande: ${compressedSizeMB.toFixed(2)}MB`);
     }
 
     // 3. Subir a Supabase Storage
     const fileName = `${folder}/${Date.now()}-${req.file.originalname.replace(/\.[^/.]+$/, '')}.mp4`;
     const fileBuffer = fs.readFileSync(outputPath);
 
-    const { data, error } = await supabase.storage
+    const { data, error } = await supabaseClient.storage
       .from(bucket)
       .upload(fileName, fileBuffer, {
         contentType: 'video/mp4',
@@ -82,7 +108,7 @@ app.post('/compress', upload.single('video'), async (req, res) => {
     if (error) throw error;
 
     // 4. Obtener URL pública
-    const { data: urlData } = supabase.storage
+    const { data: urlData } = supabaseClient.storage
       .from(bucket)
       .getPublicUrl(fileName);
 
@@ -106,7 +132,6 @@ app.post('/compress', upload.single('video'), async (req, res) => {
   } catch (error) {
     console.error('[Compress] Error:', error);
     
-    // Limpiar archivos en caso de error
     if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     
@@ -117,4 +142,6 @@ app.post('/compress', upload.single('video'), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Video compressor running on port ${PORT}`);
+  console.log(`SUPABASE_URL: ${process.env.SUPABASE_URL ? 'configured' : 'missing'}`);
+  console.log(`SUPABASE_SERVICE_KEY: ${process.env.SUPABASE_SERVICE_KEY ? 'configured' : 'missing'}`);
 });
